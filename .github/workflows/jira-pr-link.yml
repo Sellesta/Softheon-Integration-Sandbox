@@ -1,0 +1,49 @@
+name: Jira PR Linker
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+jobs:
+  link-jira:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract Jira issue key from branch
+        id: extract
+        run: |
+          BRANCH_NAME="${GITHUB_HEAD_REF}"
+          echo "Branch: $BRANCH_NAME"
+          ISSUE_KEY=$(echo $BRANCH_NAME | grep -oE 'SCRUM-[0-9]+')
+          if [ -z "$ISSUE_KEY" ]; then
+            echo "No Jira issue key found in branch name."
+            exit 0
+          fi
+          echo "ISSUE_KEY=$ISSUE_KEY" >> $GITHUB_ENV
+
+      - name: Update Jira Issue with PR link
+        if: env.ISSUE_KEY != ''
+        run: |
+          curl -X POST \
+            -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{
+              "body": "Linked PR: '${{ github.event.pull_request.html_url }}'"
+            }' \
+            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/${{ env.ISSUE_KEY }}/comment"
+
+      - name: Auto-update PR description with Jira link
+        if: env.ISSUE_KEY != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueKey = process.env.ISSUE_KEY;
+            const pr = context.payload.pull_request;
+            const jiraUrl = `${process.env.JIRA_BASE_URL}/browse/${issueKey}`;
+            const newBody = `### Linked Jira Issue\n[${issueKey}](${jiraUrl})\n\n${pr.body || ''}`;
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              body: newBody
+            });
