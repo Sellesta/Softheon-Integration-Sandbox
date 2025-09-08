@@ -1,49 +1,127 @@
-name: Jira PR Linker
+name: Jira PR Automation
 
 on:
   pull_request:
-    types: [opened, edited, reopened, synchronize]
+    types: [opened, reopened, synchronize, closed, edited]
 
 jobs:
-  link-jira:
+  jira:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Extract Jira issue key from branch
+      - name: Extract Jira keys from branch + PR
         id: extract
         run: |
-          BRANCH_NAME="${GITHUB_HEAD_REF}"
-          echo "Branch: $BRANCH_NAME"
-          ISSUE_KEY=$(echo $BRANCH_NAME | grep -oE 'SCRUM-[0-9]+')
-          if [ -z "$ISSUE_KEY" ]; then
-            echo "No Jira issue key found in branch name."
-            exit 0
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+          TITLE="${{ github.event.pull_request.title }}"
+          BODY="${{ github.event.pull_request.body }}"
+
+          echo "Branch: $BRANCH"
+          echo "Title: $TITLE"
+          echo "Body: $BODY"
+
+          # Collect all Jira keys from branch, title, and description
+          ALL_TEXT="$BRANCH $TITLE $BODY"
+          JIRA_KEYS=$(echo "$ALL_TEXT" | grep -oE '[A-Z][A-Z0-9]{1,9}-[0-9]+' | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ *$//')
+
+          if [ -n "$JIRA_KEYS" ]; then
+            echo "JIRA_KEYS=$JIRA_KEYS" >> $GITHUB_ENV
+            echo "found=true" >> $GITHUB_ENV
+            echo "✅ Found Jira keys: $JIRA_KEYS"
+          else
+            echo "found=false" >> $GITHUB_ENV
+            echo "⚠️ No Jira issue key found."
           fi
-          echo "ISSUE_KEY=$ISSUE_KEY" >> $GITHUB_ENV
 
-      - name: Update Jira Issue with PR link
-        if: env.ISSUE_KEY != ''
+      - name: Stop if no Jira key
+        if: env.found == 'false'
+        run: echo "Skipping Jira integration (no Jira key detected)."
+
+      - name: Link PR to Jira issues
+        if: env.found == 'true' && github.event.action != 'closed'
         run: |
-          curl -X POST \
-            -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            --data '{
-              "body": "Linked PR: '${{ github.event.pull_request.html_url }}'"
-            }' \
-            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/${{ env.ISSUE_KEY }}/comment"
+          for KEY in $JIRA_KEYS; do
+            echo "🔗 Linking PR to $KEY"
+            curl -X POST \
+              -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"object\": {
+                  \"url\": \"${{ github.event.pull_request.html_url }}\",
+                  \"title\": \"${{ github.event.pull_request.title }}\"
+                }
+              }" \
+              "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$KEY/remotelink"
+          done
 
-      - name: Auto-update PR description with Jira link
-        if: env.ISSUE_KEY != ''
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const issueKey = process.env.ISSUE_KEY;
-            const pr = context.payload.pull_request;
-            const jiraUrl = `${process.env.JIRA_BASE_URL}/browse/${issueKey}`;
-            const newBody = `### Linked Jira Issue\n[${issueKey}](${jiraUrl})\n\n${pr.body || ''}`;
-            await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pr.number,
-              body: newBody
-            });
+      - name: Add Jira comment (PR opened/reopened/updated/edited)
+        if: env.found == 'true' && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'synchronize' || github.event.action == 'edited')
+        run: |
+          for KEY in $JIRA_KEYS; do
+            echo "💬 Commenting on $KEY"
+            curl -X POST \
+              -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"body\": \"🔗 Pull Request [${{ github.event.pull_request.title }}](${{ github.event.pull_request.html_url }}) has been **${{ github.event.action }}**.\"
+              }" \
+              "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$KEY/comment"
+          done
+
+      - name: Transition Jira issues to In Progress (when PR opened)
+        if: env.found == 'true' && (github.event.action == 'opened' || github.event.action == 'reopened')
+        run: |
+          for KEY in $JIRA_KEYS; do
+            TRANSITION_ID=$(curl -s -X GET \
+              -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$KEY/transitions" \
+              | jq -r '.transitions[] | select(.name=="In Progress") | .id')
+
+            if [ -n "$TRANSITION_ID" ]; then
+              echo "🚀 Moving $KEY to In Progress"
+              curl -X POST \
+                -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+                -H "Content-Type: application/json" \
+                --data "{
+                  \"transition\": { \"id\": \"$TRANSITION_ID\" }
+                }" \
+                "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$KEY/transitions"
+            fi
+          done
+
+      - name: Transition Jira issues to Done (when PR merged)
+        if: env.found == 'true' && github.event.action == 'closed' && github.event.pull_request.merged == true
+        run: |
+          for KEY in $JIRA_KEYS; do
+            TRANSITION_ID=$(curl -s -X GET \
+              -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$KEY/transitions" \
+              | jq -r '.transitions[] | select(.name=="Done") | .id')
+
+            if [ -n "$TRANSITION_ID" ]; then
+              echo "✅ Moving $KEY to Done"
+              curl -X POST \
+                -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+                -H "Content-Type: application/json" \
+                --data "{
+                  \"transition\": { \"id\": \"$TRANSITION_ID\" }
+                }" \
+                "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$KEY/transitions"
+            fi
+          done
+
+      - name: Add Jira comment (PR merged)
+        if: env.found == 'true' && github.event.action == 'closed' && github.event.pull_request.merged == true
+        run: |
+          for KEY in $JIRA_KEYS; do
+            echo "💬 Commenting merge on $KEY"
+            curl -X POST \
+              -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"body\": \"✅ Pull Request [${{ github.event.pull_request.title }}](${{ github.event.pull_request.html_url }}) has been **merged** and the issue is marked as Done.\"
+              }" \
+              "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$KEY/comment"
+          done
